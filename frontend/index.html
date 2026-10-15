@@ -1,705 +1,327 @@
-```html
 <!DOCTYPE html>
 <html lang="en">
 
 <head>
-
     <meta charset="UTF-8">
-
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-
     <title>AI Answer Evaluator</title>
-
     <link rel="stylesheet" href="style.css">
-
-    <!-- Chart.js -->
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
-
 </head>
 
-
 <body>
+    <!-- LOGIN -->
+    <section id="loginPage" class="page active login-page">
+        <div class="login-shell">
+            <div class="login-visual">
+                <div class="brand-mark">AE</div>
+                <div class="eyebrow">SMARTER ASSESSMENT</div>
+                <h1>Make every evaluation<br><span>more meaningful.</span></h1>
+                <p>One workspace for answer keys, trusted textbooks, and consistent AI-assisted assessment.</p>
+                <div class="login-feature-list">
+                    <div><span class="feature-check">✓</span><span><strong>Grounded evaluation</strong><small>Use your
+                                selected textbook as reference.</small></span></div>
+                    <div><span class="feature-check">✓</span><span><strong>Reusable resources</strong><small>Keep
+                                processed textbooks in your library.</small></span></div>
+                    <div><span class="feature-check">✓</span><span><strong>Clear feedback</strong><small>Review marks
+                                and question-wise insights.</small></span></div>
+                </div>
+                <div class="visual-footer">AI Answer Evaluator <span>•</span> Teacher workspace</div>
+            </div>
+            <div class="login-panel">
+                <div class="login-panel-top"><span class="mini-mark">AE</span><span class="secure-label">TEACHER
+                        PORTAL</span></div>
+                <div class="login-intro">
+                    <div class="eyebrow">WELCOME BACK</div>
+                    <h2>Sign in to continue</h2>
+                    <p>Access your reference library and evaluate student answer scripts.</p>
+                </div>
+                <form id="loginForm">
+                    <label for="username">Username</label>
+                    <input type="text" id="username" placeholder="Enter your username" autocomplete="username" required>
+                    <label for="password">Password</label>
+                    <input type="password" id="password" placeholder="Enter your password"
+                        autocomplete="current-password" required>
+                    <button type="submit" class="primary-btn login-btn">Sign in <span>→</span></button>
+                </form>
+                <div class="demo-box"><span class="demo-dot"></span>
+                    <div><strong>Demo access</strong>
+                        <p>Username: <code>teacher</code> &nbsp; Password: <code>teacher123</code></p>
+                    </div>
+                </div>
+                <p class="login-note">Your textbook library is loaded from the connected backend.</p>
+            </div>
+        </div>
+    </section>
 
-
-<!-- =====================================================
-     PAGE 1 : LOGIN
-===================================================== -->
-
-<section id="loginPage" class="page active">
-
-    <div class="login-container">
-
-        <div class="brand">
-
-            <div class="brand-icon">
-                AI
+    <!-- REFERENCE MATERIALS -->
+    <section id="referencePage" class="page">
+        <header class="topbar">
+            <a class="topbar-brand" href="#" aria-label="AI Answer Evaluator home">
+                <span class="mini-mark">AE</span>
+                <span><strong>Answer Evaluator</strong><small>TEACHER WORKSPACE</small></span>
+            </a>
+            <div class="topbar-right"><span class="connection-indicator"><i></i> Evaluation workspace</span><button
+                    class="logout-btn" onclick="logout()">Log out</button></div>
+        </header>
+        <main class="main-content">
+            <div class="welcome-row">
+                <div>
+                    <div class="eyebrow">STEP 01 / SET UP EVALUATION</div>
+                    <h1>Reference materials</h1>
+                    <p>Choose a saved textbook and upload the answer key. New textbooks can be processed and stored in
+                        your library.</p>
+                </div>
+                <div class="step-pill"><span>01</span> Reference setup <b>—</b> <span class="muted-step">02 Student
+                        script</span></div>
             </div>
 
-            <h1>
-                AI Answer Evaluator
-            </h1>
+            <div class="reference-layout">
+                <section class="panel library-panel">
+                    <div class="panel-heading">
+                        <div class="panel-icon library-icon">▤</div>
+                        <div>
+                            <h2>Your textbook library</h2>
+                            <p>Processed textbooks ready to reuse</p>
+                        </div>
+                        <span class="library-count" id="libraryCount">0 saved</span>
+                    </div>
+                    <div class="library-toolbar">
+                        <label class="visually-hidden" for="textbookSelect">Select a saved textbook</label>
+                        <select id="textbookSelect">
+                            <option value="">Loading saved textbooks...</option>
+                        </select>
+                        <button type="button" class="icon-button" onclick="loadSavedTextbooks(true)"
+                            title="Refresh textbook library" aria-label="Refresh textbook library">↻</button>
+                    </div>
+                    <div id="textbookLibraryList" class="library-list">
+                        <div class="library-empty"><span class="empty-icon">▤</span><strong>Loading your
+                                library</strong>
+                            <p>Saved textbooks will appear here.</p>
+                        </div>
+                    </div>
+                    <div class="library-divider"></div>
+                    <div class="upload-new-heading"><span class="upload-new-icon">＋</span>
+                        <div>
+                            <h3>Add a textbook</h3>
+                            <p>First time using a textbook? Upload and process it once.</p>
+                        </div>
+                    </div>
+                    <label class="drop-zone" for="newTextbookFile" id="textbookDropZone">
+                        <span class="drop-icon">↑</span>
+                        <strong>Choose a textbook PDF</strong>
+                        <small>PDF format · Processed textbooks are saved for later use</small>
+                        <input type="file" id="newTextbookFile" accept=".pdf,application/pdf">
+                    </label>
+                    <p id="newTextbookFileName" class="selected-file-note">No new textbook selected</p>
+                    <button type="button" id="processTextbookBtn" class="secondary-action full-width"
+                        onclick="processNewTextbook()">Upload &amp; process textbook <span>→</span></button>
+                    <div id="textbookProcessStatus" class="inline-status" role="status" aria-live="polite"></div>
+                </section>
 
-            <p>
-                Intelligent Answer Script Evaluation System
-            </p>
+                <section class="panel answer-key-panel">
+                    <div class="panel-heading">
+                        <div class="panel-icon key-icon">✓</div>
+                        <div>
+                            <h2>Answer key</h2>
+                            <p>Official answers or marking scheme</p>
+                        </div>
+                    </div>
+                    <div class="key-upload-area">
+                        <div class="document-illustration"><span>PDF</span><i>✓</i></div>
+                        <h3>Upload your answer key</h3>
+                        <p>Choose the PDF containing the questions and reference answers used to assess student
+                            responses.</p>
+                        <label class="file-picker" for="answerKey"><span>＋</span> Choose answer key PDF
+                            <input type="file" id="answerKey" accept=".pdf,application/pdf">
+                        </label>
+                        <p id="answerKeyName" class="file-name">No answer key selected</p>
+                    </div>
+                    <div class="selected-reference" id="selectedReferenceSummary">
+                        <div class="summary-row"><span class="summary-check">✓</span>
+                            <div><strong>Selected textbook</strong>
+                                <p id="selectedTextbookSummary">Select a textbook from your library</p>
+                            </div>
+                        </div>
+                        <div class="summary-row"><span class="summary-check">✓</span>
+                            <div><strong>Answer key</strong>
+                                <p id="selectedAnswerKeySummary">Upload an answer key PDF</p>
+                            </div>
+                        </div>
+                    </div>
+                    <div id="referenceStatus" class="reference-status hidden" role="status">
+                        <span class="status-circle">✓</span>
+                        <div><strong>References ready</strong>
+                            <p>Your answer key and textbook are ready to use.</p>
+                        </div>
+                    </div>
+                    <button type="button" class="primary-btn full-width continue-btn"
+                        onclick="goToStudentPage()">Continue to student details <span>→</span></button>
+                    <p class="privacy-note"><span>⌑</span> Your selected textbook is reused from the library. It does
+                        not need to be uploaded for every student.</p>
+                </section>
+            </div>
+            <div class="workflow-note"><span class="workflow-note-icon">✦</span>
+                <div><strong>Designed for repeat evaluations</strong>
+                    <p>Process a textbook once, then use it with the same answer key to evaluate multiple students.</p>
+                </div>
+            </div>
+        </main>
+    </section>
 
+    <!-- STUDENT DETAILS -->
+    <section id="studentPage" class="page">
+        <header class="topbar">
+            <a class="topbar-brand" href="#" aria-label="AI Answer Evaluator home"><span
+                    class="mini-mark">AE</span><span><strong>Answer Evaluator</strong><small>TEACHER
+                        WORKSPACE</small></span></a>
+            <div class="topbar-right"><button class="secondary-btn" onclick="backToReference()">← Reference
+                    materials</button><button class="logout-btn" onclick="logout()">Log out</button></div>
+        </header>
+        <main class="main-content narrow-content">
+            <div class="welcome-row">
+                <div>
+                    <div class="eyebrow">STEP 02 / STUDENT SUBMISSION</div>
+                    <h1>Student details</h1>
+                    <p>Add the student information and upload their answer booklet.</p>
+                </div>
+                <div class="step-pill"><span>01</span> References <b>—</b> <span class="active-step">02 Student
+                        script</span></div>
+            </div>
+            <div class="panel student-card">
+                <div class="panel-heading">
+                    <div class="panel-icon student-icon">01</div>
+                    <div>
+                        <h2>Student information</h2>
+                        <p>Enter the details exactly as recorded.</p>
+                    </div>
+                </div>
+                <div class="student-grid">
+                    <div><label for="studentName">Student name</label><input type="text" id="studentName"
+                            placeholder="e.g. Ananya Rao" autocomplete="name"></div>
+                    <div><label for="studentUSN">USN / Student ID</label><input type="text" id="studentUSN"
+                            placeholder="e.g. 4NM23CS001" autocomplete="off"></div>
+                </div>
+                <div class="section-divider"></div>
+                <div class="panel-heading script-heading">
+                    <div class="panel-icon script-icon">PDF</div>
+                    <div>
+                        <h2>Answer script</h2>
+                        <p>Upload the student's handwritten answer booklet.</p>
+                    </div>
+                </div>
+                <label class="script-drop-zone" for="answerScript"><span
+                        class="script-upload-symbol">↑</span><strong>Choose answer script PDF</strong><small>Upload a
+                        clear scan of the complete answer booklet.</small><input type="file" id="answerScript"
+                        accept=".pdf,application/pdf"></label>
+                <p id="answerScriptName" class="file-name">No answer script selected</p>
+
+                <div class="ocr-action-row">
+                    <button type="button" id="extractOcrBtn" class="secondary-action full-width extract-ocr-btn"
+                        onclick="extractHandwriting()">
+                        <span>✍</span> Extract handwriting (OCR) <span>→</span>
+                    </button>
+                </div>
+                <div id="ocrStatus" class="inline-status" role="status" aria-live="polite"></div>
+
+                <!-- EXTRACTED HANDWRITING PREVIEW -->
+                <div id="ocrPreviewContainer" class="ocr-preview-panel hidden">
+                    <div class="ocr-preview-header">
+                        <div>
+                            <h3>Extracted Answers</h3>
+                            <p id="ocrSummaryText">Detecting questions...</p>
+                        </div>
+                        <div class="ocr-header-badges">
+                            <span id="ocrCacheBadge" class="cache-badge hidden">⚡ Database Cache</span>
+                            <span id="ocrConfidenceBadge" class="confidence-badge">0% Confidence</span>
+                        </div>
+                    </div>
+                    <div id="ocrQuestionsList" class="ocr-questions-list"></div>
+                </div>
+
+                <div class="student-reference-strip"><span class="summary-check">✓</span>
+                    <div><strong>Reference materials retained</strong>
+                        <p id="studentTextbookSummary">Your selected textbook and answer key will be reused.</p>
+                    </div>
+                </div>
+                <button type="button" class="primary-btn full-width evaluate-btn" onclick="evaluateStudent()">Evaluate
+                    answer script <span>✦</span></button>
+            </div>
+        </main>
+    </section>
+
+    <!-- RESULTS -->
+    <section id="resultPage" class="page">
+        <header class="topbar">
+            <a class="topbar-brand" href="#" aria-label="AI Answer Evaluator home"><span
+                    class="mini-mark">AE</span><span><strong>Answer Evaluator</strong><small>TEACHER
+                        WORKSPACE</small></span></a>
+            <div class="topbar-right"><button class="logout-btn" onclick="logout()">Log out</button></div>
+        </header>
+        <main class="main-content">
+            <div id="resultContent">
+                <div class="welcome-row result-welcome">
+                    <div>
+                        <div class="eyebrow">EVALUATION REPORT</div>
+                        <h1>Evaluation complete</h1>
+                        <p>Review the student's score and download the question-wise report.</p>
+                    </div>
+                    <div class="result-badge"><span>✓</span> AI-assisted evaluation</div>
+                </div>
+                <div class="result-header">
+                    <div>
+                        <h2 id="resultStudentName">Student Name</h2>
+                        <p id="resultUSN">USN</p>
+                    </div>
+                    <div class="result-textbook" id="resultTextbook"></div>
+                </div>
+                <div class="result-grid">
+                    <div class="panel score-card">
+                        <div class="eyebrow">OVERALL PERFORMANCE</div>
+                        <h3>Total score</h3>
+                        <div class="score-number"><span id="obtainedMarks">0</span><span class="score-total"> / <span
+                                    id="totalMarks">0</span></span></div>
+                        <div class="percentage" id="percentage">0%</div>
+                        <div class="rating" id="rating">Evaluation complete</div>
+                    </div>
+                    <div class="panel chart-card">
+                        <h3>Performance overview</h3>
+                        <p class="panel-subtitle">Marks obtained compared with remaining marks</p>
+                        <div class="chart-container"><canvas id="marksChart"></canvas></div>
+                    </div>
+                </div>
+                <div class="panel download-card">
+                    <div class="download-icon">↓</div>
+                    <div class="download-info">
+                        <h2>Detailed evaluation report</h2>
+                        <p>Download question-wise marks, answers, feedback, and textbook support.</p>
+                    </div><button class="secondary-action" onclick="downloadDetails()">Download report
+                        <span>↓</span></button>
+                </div>
+                <div class="result-actions"><button class="primary-btn" onclick="nextStudent()">＋ Evaluate next
+                        student</button><button class="outline-btn" onclick="exitEvaluation()">Return to
+                        references</button></div>
+            </div>
+        </main>
+    </section>
+
+    <!-- FULL-SCREEN PROGRESS OVERLAY -->
+    <div id="evaluationLoading" class="loading-overlay" style="display:none" role="status" aria-live="polite">
+        <div class="loading-card">
+            <div class="loading-brand"><span class="mini-mark">AE</span><span>AI Answer Evaluator</span></div>
+            <div class="loading-spinner"></div>
+            <div class="eyebrow">PLEASE WAIT</div>
+            <h2 id="loadingTitle">Preparing your answer script...</h2>
+            <p id="loadingMessage">Getting your documents ready for evaluation.</p>
+            <div class="progress-track">
+                <div id="progressBar"></div>
+            </div>
+            <p id="progressPercent">Evaluation in progress</p>
+            <p class="loading-note">Handwriting recognition and AI assessment can take a few minutes. Please keep this
+                page open.</p>
         </div>
-
-
-        <div class="card login-card">
-
-            <h2>
-                Teacher Login
-            </h2>
-
-            <p class="subtitle">
-                Login to access the evaluation system
-            </p>
-
-
-            <form id="loginForm">
-
-                <label for="username">
-                    Username
-                </label>
-
-                <input
-                    type="text"
-                    id="username"
-                    placeholder="Enter username"
-                    required
-                >
-
-
-                <label for="password">
-                    Password
-                </label>
-
-                <input
-                    type="password"
-                    id="password"
-                    placeholder="Enter password"
-                    required
-                >
-
-
-                <button
-                    type="submit"
-                    class="primary-btn login-btn"
-                >
-                    Login
-                </button>
-
-            </form>
-
-
-            <p class="demo-text">
-                Demo login: teacher / teacher123
-            </p>
-
-        </div>
-
     </div>
-
-</section>
-
-
-
-<!-- =====================================================
-     PAGE 2 : REFERENCE MATERIALS
-===================================================== -->
-
-<section id="referencePage" class="page">
-
-
-    <!-- TOP BAR -->
-
-    <header class="topbar">
-
-        <div class="topbar-brand">
-
-            <div class="small-icon">
-                AI
-            </div>
-
-            <div>
-
-                <h2>
-                    AI Answer Evaluator
-                </h2>
-
-                <span>
-                    Teacher Dashboard
-                </span>
-
-            </div>
-
-        </div>
-
-
-        <button
-            class="logout-btn"
-            onclick="logout()"
-        >
-            Logout
-        </button>
-
-    </header>
-
-
-
-    <!-- MAIN CONTENT -->
-
-    <main class="main-content">
-
-
-        <div class="page-heading">
-
-            <span class="step">
-                STEP 1
-            </span>
-
-            <h1>
-                Reference Materials
-            </h1>
-
-            <p>
-                Upload the answer key and textbook used for evaluation.
-            </p>
-
-        </div>
-
-
-
-        <!-- UPLOAD CARDS -->
-
-        <div class="upload-grid">
-
-
-            <!-- ANSWER KEY -->
-
-            <div class="upload-card">
-
-                <div class="upload-icon">
-                    ✓
-                </div>
-
-                <h2>
-                    Answer Key
-                </h2>
-
-                <p>
-                    Upload the official answer key or marking scheme.
-                </p>
-
-
-                <label class="file-upload">
-
-                    <input
-                        type="file"
-                        id="answerKey"
-                        accept=".pdf"
-                        onchange="handleReferenceFile('answerKey', 'answerKeyName')"
-                    >
-
-                    <span>
-                        Choose Answer Key PDF
-                    </span>
-
-                </label>
-
-
-                <p
-                    id="answerKeyName"
-                    class="file-name"
-                >
-                    No file selected
-                </p>
-
-            </div>
-
-
-
-            <!-- TEXTBOOK -->
-
-            <div class="upload-card">
-
-                <div class="upload-icon">
-                    📖
-                </div>
-
-                <h2>
-                    Textbook
-                </h2>
-
-                <p>
-                    Upload the textbook or reference material.
-                </p>
-
-
-                <label class="file-upload">
-
-                    <input
-                        type="file"
-                        id="textbook"
-                        accept=".pdf"
-                        onchange="handleReferenceFile('textbook', 'textbookName')"
-                    >
-
-                    <span>
-                        Choose Textbook PDF
-                    </span>
-
-                </label>
-
-
-                <p
-                    id="textbookName"
-                    class="file-name"
-                >
-                    No file selected
-                </p>
-
-            </div>
-
-        </div>
-
-
-
-        <!-- STATUS -->
-
-        <div
-            id="referenceStatus"
-            class="reference-status hidden"
-        >
-
-            <div class="status-circle">
-                ✓
-            </div>
-
-            <div>
-
-                <strong>
-                    Reference materials ready
-                </strong>
-
-                <p>
-                    Answer key and textbook are ready for evaluation.
-                </p>
-
-            </div>
-
-        </div>
-
-
-
-        <!-- CONTINUE -->
-
-        <div class="bottom-actions">
-
-            <button
-                class="primary-btn large-btn"
-                onclick="goToStudentPage()"
-            >
-                Continue to Student →
-            </button>
-
-        </div>
-
-    </main>
-
-</section>
-
-
-
-<!-- =====================================================
-     PAGE 3 : STUDENT DETAILS
-===================================================== -->
-
-<section id="studentPage" class="page">
-
-
-    <!-- TOP BAR -->
-
-    <header class="topbar">
-
-        <div class="topbar-brand">
-
-            <div class="small-icon">
-                AI
-            </div>
-
-            <div>
-
-                <h2>
-                    AI Answer Evaluator
-                </h2>
-
-                <span>
-                    Student Evaluation
-                </span>
-
-            </div>
-
-        </div>
-
-
-        <button
-            class="secondary-btn"
-            onclick="backToReference()"
-        >
-            ← Reference Materials
-        </button>
-
-    </header>
-
-
-
-    <!-- MAIN CONTENT -->
-
-    <main class="main-content narrow-content">
-
-
-        <div class="page-heading">
-
-            <span class="step">
-                STEP 2
-            </span>
-
-            <h1>
-                Student Details
-            </h1>
-
-            <p>
-                Enter student information and upload the answer script.
-            </p>
-
-        </div>
-
-
-
-        <div class="card student-card">
-
-
-            <!-- STUDENT INFORMATION -->
-
-            <div class="student-grid">
-
-
-                <div>
-
-                    <label for="studentName">
-                        Student Name
-                    </label>
-
-                    <input
-                        type="text"
-                        id="studentName"
-                        placeholder="Enter student's name"
-                    >
-
-                </div>
-
-
-                <div>
-
-                    <label for="studentUSN">
-                        USN
-                    </label>
-
-                    <input
-                        type="text"
-                        id="studentUSN"
-                        placeholder="Enter student's USN"
-                    >
-
-                </div>
-
-            </div>
-
-
-
-            <!-- ANSWER SCRIPT -->
-
-            <div class="script-upload">
-
-
-                <div class="large-upload-icon">
-                    📄
-                </div>
-
-
-                <h2>
-                    Upload Answer Script
-                </h2>
-
-
-                <p>
-                    Upload the student's answer booklet in PDF format.
-                </p>
-
-
-                <label class="file-upload">
-
-                    <input
-                        type="file"
-                        id="answerScript"
-                        accept=".pdf"
-                        onchange="handleStudentFile()"
-                    >
-
-                    <span>
-                        Choose Answer Script PDF
-                    </span>
-
-                </label>
-
-
-                <p
-                    id="answerScriptName"
-                    class="file-name"
-                >
-                    No file selected
-                </p>
-
-            </div>
-
-
-
-            <!-- EVALUATE -->
-
-            <button
-                class="primary-btn evaluate-btn"
-                onclick="evaluateStudent()"
-            >
-
-                🤖
-                Evaluate Answer Script
-
-            </button>
-
-        </div>
-
-    </main>
-
-</section>
-
-
-
-<!-- =====================================================
-     PAGE 4 : EVALUATION RESULT
-===================================================== -->
-
-<section id="resultPage" class="page">
-
-
-    <!-- TOP BAR -->
-
-    <header class="topbar">
-
-        <div class="topbar-brand">
-
-            <div class="small-icon">
-                AI
-            </div>
-
-            <div>
-
-                <h2>
-                    AI Answer Evaluator
-                </h2>
-
-                <span>
-                    Evaluation Result
-                </span>
-
-            </div>
-
-        </div>
-
-    </header>
-
-
-
-    <!-- MAIN CONTENT -->
-
-    <main class="main-content">
-
-
-        <!-- RESULT HEADER -->
-
-        <div class="result-header">
-
-
-            <div>
-
-                <span class="step">
-                    EVALUATION COMPLETE
-                </span>
-
-
-                <h1 id="resultStudentName">
-                    Student Name
-                </h1>
-
-
-                <p id="resultUSN">
-                    USN
-                </p>
-
-            </div>
-
-
-            <div class="result-badge">
-                ✓ AI Evaluated
-            </div>
-
-        </div>
-
-
-
-        <!-- SCORE + CHART -->
-
-        <div class="result-grid">
-
-
-            <!-- SCORE -->
-
-            <div class="card score-card">
-
-                <h3>
-                    Total Score
-                </h3>
-
-
-                <div class="score-number">
-
-                    <span id="obtainedMarks">
-                        38
-                    </span>
-
-                    <span class="score-total">
-
-                        /
-                        <span id="totalMarks">
-                            50
-                        </span>
-
-                    </span>
-
-                </div>
-
-
-                <div
-                    class="percentage"
-                    id="percentage"
-                >
-                    76%
-                </div>
-
-
-                <div
-                    class="rating"
-                    id="rating"
-                >
-                    Very Good Performance
-                </div>
-
-            </div>
-
-
-
-            <!-- CHART -->
-
-            <div class="card chart-card">
-
-                <h3>
-                    Performance Overview
-                </h3>
-
-
-                <div class="chart-container">
-
-                    <canvas
-                        id="marksChart"
-                    ></canvas>
-
-                </div>
-
-            </div>
-
-        </div>
-
-
-
-        <!-- DOWNLOAD DETAILS -->
-
-        <div class="card download-card">
-
-
-            <div class="download-icon">
-                📋
-            </div>
-
-
-            <div class="download-info">
-
-                <h2>
-                    Detailed Evaluation
-                </h2>
-
-                <p>
-                    Download the complete question-wise evaluation,
-                    marks distribution and AI feedback.
-                </p>
-
-            </div>
-
-
-            <button
-                class="download-btn"
-                onclick="downloadDetails()"
-            >
-                ↓ Download Details
-            </button>
-
-        </div>
-
-
-
-        <!-- ACTION BUTTONS -->
-
-        <div class="result-actions">
-
-
-            <button
-                class="primary-btn"
-                onclick="nextStudent()"
-            >
-                + Evaluate Next Student
-            </button>
-
-
-            <button
-                class="exit-btn"
-                onclick="exitEvaluation()"
-            >
-                Exit Evaluation
-            </button>
-
-        </div>
-
-    </main>
-
-</section>
-
-
-
-<!-- JAVASCRIPT -->
-
-<script src="script.js"></script>
-
+    <script src="script.js"></script>
 </body>
 
 </html>
-```

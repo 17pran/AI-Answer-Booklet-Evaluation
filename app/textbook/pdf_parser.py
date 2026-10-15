@@ -1,25 +1,35 @@
 import pymupdf
 
 
-def extract_text(pdf_path: str):
+def extract_text(pdf_path: str) -> list[dict]:
+    """
+    Extract text from a PDF page by page.
 
-    document = pymupdf.open(pdf_path)
+    Returns:
+        [
+            {
+                "page": 1,
+                "text": "..."
+            },
+            ...
+        ]
+    """
 
     pages = []
 
-    for page_number, page in enumerate(
-        document,
-        start=1
-    ):
+    with pymupdf.open(pdf_path) as document:
 
-        text = page.get_text("text").strip()
+        for page_number, page in enumerate(document, start=1):
 
-        if text:
-            pages.append({
-                "page": page_number,
-                "text": text
-            })
+            text = page.get_text("text")
 
-    document.close()
+            if text:
+                text = text.strip()
+
+            if text:
+                pages.append({
+                    "page": page_number,
+                    "text": text
+                })
 
     return pages

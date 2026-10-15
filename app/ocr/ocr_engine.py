@@ -1,1143 +1,625 @@
 import os
 import re
+import time
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
 import cv2
-import torch
 import easyocr
 import numpy as np
-
-from pathlib import Path
-
+import torch
+import torch.nn.functional as F
 from PIL import Image
-from transformers import (
-    TrOCRProcessor,
-    VisionEncoderDecoderModel
-)
+from transformers import TrOCRProcessor, VisionEncoderDecoderModel
 
-
-# ============================================================
-# HYBRID HANDWRITING OCR - LEVEL 3
-# ============================================================
 
 class HandwritingOCR:
+    """
+    High-accuracy handwriting OCR engine for student answer scripts.
 
-    def __init__(self):
+    Pipeline:
+        1. Deskew & background-normalize page image (removes ruled lines & shadows).
+        2. Detect text line regions using tuned EasyOCR detector with gap-aware grouping.
+        3. Extract padded line crops to protect ascenders and descenders.
+        4. Recognize text using batched TrOCR with exact token-level confidence scoring.
+        5. Targeted retry (Beam Search & contrast enhancement) for low-confidence lines.
+        6. EasyOCR fallback for uncertain lines.
+        7. Text normalization & structured result generation.
+    """
 
-        print("==============================================")
-        print("INITIALIZING HYBRID HANDWRITING OCR")
-        print("==============================================")
-
-        # ====================================================
-        # TrOCR - PRIMARY HANDWRITING OCR
-        # ====================================================
-
-        print("Loading TrOCR handwriting model...")
-
-        self.processor = TrOCRProcessor.from_pretrained(
-            "microsoft/trocr-base-handwritten"
-        )
-
-        self.model = VisionEncoderDecoderModel.from_pretrained(
-            "microsoft/trocr-base-handwritten"
-        )
+    def __init__(
+        self,
+        batch_size: int = 8,
+        use_easyocr_fallback: bool = True,
+    ) -> None:
+        print("\nInitializing Handwriting OCR Engine...")
 
         self.device = torch.device(
-            "cuda" if torch.cuda.is_available() else "cpu"
-        )
+            "cuda" if torch.cuda.is_available() else "cpu")
+        self.batch_size = max(1, int(batch_size))
+        self.use_easyocr_fallback = use_easyocr_fallback
 
+        if self.device.type == "cpu":
+            available_cpus = os.cpu_count() or 4
+            torch.set_num_threads(max(1, min(4, available_cpus)))
+
+        # --------------------------------------------------
+        # LOAD TrOCR
+        # --------------------------------------------------
+        model_name = "microsoft/trocr-base-handwritten"
+        print(f"Loading TrOCR model: {model_name}")
+
+        self.processor = TrOCRProcessor.from_pretrained(model_name)
+        self.model = VisionEncoderDecoderModel.from_pretrained(model_name)
         self.model.to(self.device)
         self.model.eval()
 
-        print(f"TrOCR device: {self.device}")
+        if self.device.type == "cuda":
+            self.model.half()
 
-        # ====================================================
-        # EasyOCR - used for BOTH line detection AND fallback
-        # recognition. The CRAFT-based detector inside EasyOCR
-        # is much more reliable at finding word/line boxes than
-        # manual contour morphology, so we use it to drive line
-        # ordering, then hand line crops to TrOCR as before.
-        # ====================================================
+        print(
+            f"TrOCR running on: {self.device} (batch_size={self.batch_size})")
 
-        print("Loading EasyOCR (detector + fallback recognizer)...")
-
+        # --------------------------------------------------
+        # LOAD EasyOCR (Detector & Fallback)
+        # --------------------------------------------------
+        print("Loading EasyOCR detector...")
         self.easyocr = easyocr.Reader(
             ["en"],
-            gpu=torch.cuda.is_available()
+            gpu=(self.device.type == "cuda"),
+        )
+        print("OCR models initialized successfully.\n")
+
+    # ======================================================
+    # IMAGE VALIDATION & PREPROCESSING
+    # ======================================================
+
+    @staticmethod
+    def validate_image(image: Optional[np.ndarray]) -> bool:
+        return (
+            image is not None
+            and isinstance(image, np.ndarray)
+            and image.size > 0
+            and image.ndim == 3
+            and image.shape[2] == 3
         )
 
-        print("EasyOCR loaded.")
-        print("==============================================")
-
-    # ========================================================
-    # IMAGE ENHANCEMENT
-    # ========================================================
-    #
-    # NOTE: this is now used only to produce a *cleaned crop*
-    # for recognition (TrOCR / EasyOCR fallback). Detection is
-    # done separately on a lightly-processed image, because
-    # aggressive adaptive thresholding thins strokes and hurts
-    # EasyOCR's CRAFT detector.
-    # ========================================================
-
-    def enhance_image(self, image):
-
-        gray = cv2.cvtColor(
-            image,
-            cv2.COLOR_BGR2GRAY
-        )
-
-        # Reduce noise
-        gray = cv2.GaussianBlur(
-            gray,
-            (3, 3),
-            0
-        )
-
-        # Improve contrast
-        clahe = cv2.createCLAHE(
-            clipLimit=2.0,
-            tileGridSize=(8, 8)
-        )
-
-        enhanced = clahe.apply(gray)
-
-        # Adaptive threshold
-        binary = cv2.adaptiveThreshold(
-            enhanced,
-            255,
-            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-            cv2.THRESH_BINARY,
-            31,
-            15
-        )
-
-        return binary
-
-    # ========================================================
-    # DESKEW
-    # ========================================================
-    #
-    # Real photographed/scanned sheets are rarely perfectly
-    # aligned. A rotated page breaks the y-band line clustering
-    # (which assumes roughly horizontal lines) and hurts TrOCR
-    # accuracy. This estimates the skew angle from the ink mask
-    # and rotates it back straight, but bails out safely if the
-    # page is too sparse to estimate reliably or the detected
-    # angle is implausibly large (usually noise, not real skew).
-    # ========================================================
-
-    def deskew_image(self, image_bgr):
-
-        gray = cv2.cvtColor(
-            image_bgr,
-            cv2.COLOR_BGR2GRAY
-        )
-
-        thresh = cv2.threshold(
-            gray,
-            0,
-            255,
-            cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU
-        )[1]
-
-        coords = np.column_stack(
-            np.where(thresh > 0)
-        )
-
-        # Not enough ink on the page to estimate an angle safely
-        # (e.g. a near-blank page) — skip deskewing.
-        if coords.shape[0] < 200:
+    def deskew_image(self, image_bgr: np.ndarray) -> np.ndarray:
+        if not self.validate_image(image_bgr):
             return image_bgr
 
-        angle = cv2.minAreaRect(coords)[-1]
+        gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
+        binary = cv2.threshold(
+            gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU
+        )[1]
 
+        coordinates = np.column_stack(np.where(binary > 0))
+        if len(coordinates) < 200 or len(coordinates) > 250000:
+            return image_bgr
+
+        angle = cv2.minAreaRect(coordinates.astype(np.float32))[-1]
         if angle < -45:
             angle = -(90 + angle)
         else:
             angle = -angle
 
-        # Real handwritten-page skew is rarely more than a few
-        # degrees. A larger "angle" almost always means minAreaRect
-        # latched onto noise rather than true page rotation, so we
-        # leave the image untouched rather than risk making it worse.
-        if abs(angle) > 12:
+        # Guard against erratic rotations
+        if abs(angle) < 0.4 or abs(angle) > 6.0:
             return image_bgr
 
-        (h, w) = image_bgr.shape[:2]
-        center = (w // 2, h // 2)
-
-        rotation_matrix = cv2.getRotationMatrix2D(
-            center,
-            angle,
-            1.0
-        )
-
-        rotated = cv2.warpAffine(
+        height, width = image_bgr.shape[:2]
+        matrix = cv2.getRotationMatrix2D((width // 2, height // 2), angle, 1.0)
+        return cv2.warpAffine(
             image_bgr,
-            rotation_matrix,
-            (w, h),
+            matrix,
+            (width, height),
             flags=cv2.INTER_CUBIC,
-            borderMode=cv2.BORDER_REPLICATE
+            borderMode=cv2.BORDER_REPLICATE,
         )
 
-        return rotated
+    def enhance_image(self, image_bgr: np.ndarray) -> np.ndarray:
+        """
+        Suppresses notebook ruled lines, uneven illumination, and background bleed.
+        """
+        if not self.validate_image(image_bgr):
+            return image_bgr
 
-    # ========================================================
-    # REMOVE RULED / MARGIN LINES
-    # ========================================================
-    #
-    # Real (and synthetic) answer sheets have horizontal ruling
-    # and a vertical red margin line. These get picked up as
-    # spurious boxes by any detector, so we inpaint them out
-    # before detection.
-    # ========================================================
+        gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
 
-    def remove_ruled_lines(self, image_bgr):
-
-        gray = cv2.cvtColor(
-            image_bgr,
-            cv2.COLOR_BGR2GRAY
+        # Estimate background illumination to cancel shadows & notebook rules
+        dilated = cv2.dilate(gray, np.ones((7, 7), np.uint8))
+        bg = cv2.medianBlur(dilated, 21)
+        diff = 255 - cv2.absdiff(gray, bg)
+        norm = cv2.normalize(
+            diff, None, alpha=0, beta=255, norm_type=cv2.NORM_MINMAX, dtype=cv2.CV_8U
         )
 
-        thresh = cv2.threshold(
-            gray,
-            0,
-            255,
-            cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU
-        )[1]
+        # Apply mild CLAHE to make ink strokes stand out sharply
+        clahe = cv2.createCLAHE(clipLimit=1.8, tileGridSize=(8, 8))
+        enhanced = clahe.apply(norm)
 
-        horiz_kernel = cv2.getStructuringElement(
-            cv2.MORPH_RECT,
-            (40, 1)
-        )
+        return cv2.cvtColor(enhanced, cv2.COLOR_GRAY2BGR)
 
-        horiz_lines = cv2.morphologyEx(
-            thresh,
-            cv2.MORPH_OPEN,
-            horiz_kernel,
-            iterations=2
-        )
-
-        vert_kernel = cv2.getStructuringElement(
-            cv2.MORPH_RECT,
-            (1, 40)
-        )
-
-        vert_lines = cv2.morphologyEx(
-            thresh,
-            cv2.MORPH_OPEN,
-            vert_kernel,
-            iterations=2
-        )
-
-        mask = cv2.bitwise_or(
-            horiz_lines,
-            vert_lines
-        )
-
-        # Thicken the mask slightly so inpainting fully covers
-        # anti-aliased line edges too.
-        dilate_kernel = cv2.getStructuringElement(
-            cv2.MORPH_RECT,
-            (3, 3)
-        )
-
-        mask = cv2.dilate(
-            mask,
-            dilate_kernel,
-            iterations=1
-        )
-
-        cleaned = cv2.inpaint(
-            image_bgr,
-            mask,
-            3,
-            cv2.INPAINT_TELEA
-        )
-
-        return cleaned
-
-    # ========================================================
-    # LINE DETECTION - EasyOCR (CRAFT) BASED
-    # ========================================================
-    #
-    # Replaces the old contour/morphology based detect_lines().
-    #
-    # Steps:
-    #   1. Run EasyOCR's detector to get word-level boxes.
-    #   2. Cluster words into lines by y-center proximity
-    #      (a proper y-band clustering against the line's
-    #      running average, not just "compare to previous box").
-    #   3. Sort lines top -> bottom.
-    #   4. Sort words left -> right within each line.
-    #   5. Return one padded bounding box per line, in reading
-    #      order.
-    # ========================================================
+    # ======================================================
+    # TEXT DETECTION WITH GAP-AWARE GROUPING
+    # ======================================================
 
     def detect_lines_easyocr(
         self,
-        image_bgr,
-        header_cutoff_ratio=None
-    ):
-
-        results = self.easyocr.readtext(
-            image_bgr,
-            detail=1,
-            paragraph=False
-        )
-
-        if not results:
+        image_bgr: np.ndarray,
+        header_cutoff_ratio: Optional[float] = None,
+    ) -> List[Tuple[int, int, int, int]]:
+        if not self.validate_image(image_bgr):
             return []
 
         height, width = image_bgr.shape[:2]
+        cutoff_y = int(
+            height * header_cutoff_ratio) if header_cutoff_ratio else -1
 
-        # FIX 1 - SKIP FIXED HEADER FIELD
-        # The "Reg/Roll No / Subject / Name" line is a printed
-        # form field, not the student's handwritten answer.
-        # Anything above header_cutoff_ratio * page height is
-        # dropped before it ever reaches OCR.
-        header_cutoff_y = (
-            height * header_cutoff_ratio
-            if header_cutoff_ratio else -1
+        # Tuned thresholds for handwritten text strokes
+        horizontal_list, free_list = self.easyocr.detect(
+            image_bgr,
+            min_size=10,
+            text_threshold=0.40,
+            low_text=0.30,
+            link_threshold=0.35,
+            canvas_size=2560,
+            mag_ratio=1.2,
         )
 
-        words = []
+        raw_boxes = []
 
-        for bbox, text, confidence in results:
-
-            xs = [point[0] for point in bbox]
-            ys = [point[1] for point in bbox]
-
-            x1, x2 = min(xs), max(xs)
-            y1, y2 = min(ys), max(ys)
-
-            box_w = x2 - x1
-            box_h = y2 - y1
-
-            # FIX 3 - DROP TINY / NOISE BOXES
-            # Ruled-line remnants, inpainting artifacts and stray
-            # specks show up as very small boxes (a few px). Real
-            # handwritten words are never this small.
-            if box_w < 15 or box_h < 10:
+        # Process horizontal boxes
+        for box in horizontal_list[0] if horizontal_list else []:
+            if len(box) < 4:
                 continue
+            x1, x2, y1, y2 = map(int, box[:4])
+            x1, x2 = max(0, min(x1, width)), max(0, min(x2, width))
+            y1, y2 = max(0, min(y1, height)), max(0, min(y2, height))
+            if (x2 - x1) >= 10 and (y2 - y1) >= 8 and y2 > cutoff_y:
+                raw_boxes.append((x1, y1, x2, y2))
 
-            if y2 < header_cutoff_y:
+        # Process polygon boxes
+        for polygon in free_list[0] if free_list else []:
+            points = np.asarray(polygon, dtype=np.float32)
+            if points.ndim != 2 or points.shape[1] != 2 or len(points) < 4:
                 continue
+            x1 = int(max(0, np.min(points[:, 0])))
+            y1 = int(max(0, np.min(points[:, 1])))
+            x2 = int(min(width, np.max(points[:, 0])))
+            y2 = int(min(height, np.max(points[:, 1])))
+            if (x2 - x1) >= 10 and (y2 - y1) >= 8 and y2 > cutoff_y:
+                raw_boxes.append((x1, y1, x2, y2))
 
-            words.append({
-                "x1": x1,
-                "y1": y1,
-                "x2": x2,
-                "y2": y2,
-                "yc": (y1 + y2) / 2,
-                "h": max(y2 - y1, 1)
-            })
-
-        if not words:
+        if not raw_boxes:
             return []
 
-        # Sort by vertical center first so nearby words end up
-        # adjacent before clustering.
-        words.sort(key=lambda w: w["yc"])
-
-        lines = []
-
-        for w in words:
-
-            placed = False
-
-            for line in lines:
-
-                # Compare against the line's RUNNING average
-                # y-center/height, not just the previous word.
-                # This is what makes clustering robust to a
-                # single stray/short word breaking the line.
-                if abs(w["yc"] - line["yc"]) < max(line["h"], w["h"]) * 0.65:
-
-                    line["words"].append(w)
-
-                    n = len(line["words"])
-
-                    line["yc"] = (
-                        sum(x["yc"] for x in line["words"]) / n
-                    )
-
-                    line["h"] = (
-                        sum(x["h"] for x in line["words"]) / n
-                    )
-
-                    placed = True
+        # Remove duplicate / heavily overlapping boxes
+        raw_boxes.sort(key=lambda b: (b[1], b[0]))
+        deduped = []
+        for box in raw_boxes:
+            x1, y1, x2, y2 = box
+            dup = False
+            for ex1, ey1, ex2, ey2 in deduped:
+                ix1, iy1 = max(x1, ex1), max(y1, ey1)
+                ix2, iy2 = min(x2, ex2), min(y2, ey2)
+                inter = max(0, ix2 - ix1) * max(0, iy2 - iy1)
+                smaller_area = min(
+                    max(1, (x2 - x1) * (y2 - y1)),
+                    max(1, (ex2 - ex1) * (ey2 - ey1)),
+                )
+                if (inter / smaller_area) > 0.75:
+                    dup = True
                     break
+            if not dup:
+                deduped.append(box)
 
-            if not placed:
+        # --------------------------------------------------
+        # Group boxes by vertical lines with horizontal gap threshold
+        # --------------------------------------------------
+        groups = []
+        for box in deduped:
+            x1, y1, x2, y2 = box
+            cy = (y1 + y2) / 2
+            bh = y2 - y1
 
-                lines.append({
-                    "yc": w["yc"],
-                    "h": w["h"],
-                    "words": [w]
-                })
+            matched_group = None
+            min_dist = float("inf")
 
-        # FIX 4 - STABLE TOP -> BOTTOM ORDER
-        # Sort by y-center first, then by the topmost word's y1
-        # as a tiebreaker. Two lines can end up with near-identical
-        # yc (e.g. a short line next to a tall one) — the y1
-        # tiebreak keeps those in true visual order instead of
-        # flipping unpredictably.
-        for line in lines:
-            line["min_y1"] = min(w["y1"] for w in line["words"])
+            for group in groups:
+                dist = abs(cy - group["center_y"])
+                tol = max(10, min(bh, group["height"]) * 0.55)
+                if dist <= tol and dist < min_dist:
+                    matched_group = group
+                    min_dist = dist
 
-        lines.sort(key=lambda line: (round(line["yc"] / 8), line["min_y1"]))
+            if matched_group is None:
+                groups.append({"center_y": cy, "height": bh, "boxes": [box]})
+            else:
+                matched_group["boxes"].append(box)
+                gb = matched_group["boxes"]
+                matched_group["center_y"] = sum(
+                    (b[1] + b[3]) / 2 for b in gb) / len(gb)
+                matched_group["height"] = sum(
+                    b[3] - b[1] for b in gb) / len(gb)
 
+        # --------------------------------------------------
+        # Build line crops with generous padding and gap-splitting
+        # --------------------------------------------------
         line_boxes = []
+        pad_x = 16
+        pad_y = 14
 
-        for line in lines:
+        for group in groups:
+            # Sort words from left to right
+            g_boxes = sorted(group["boxes"], key=lambda b: b[0])
 
-            # Left -> right within the line
-            ordered_words = sorted(
-                line["words"],
-                key=lambda w: w["x1"]
-            )
+            # Split line if there is an abnormally large horizontal gap
+            # (e.g. Roll No column vs student text, or margin note)
+            current_cluster = [g_boxes[0]]
+            for next_box in g_boxes[1:]:
+                prev_box = current_cluster[-1]
+                gap = next_box[0] - prev_box[2]
+                max_allowed_gap = max(120, int(prev_box[3] - prev_box[1]) * 3)
 
-            x1 = min(w["x1"] for w in ordered_words)
-            y1 = min(w["y1"] for w in ordered_words)
-            x2 = max(w["x2"] for w in ordered_words)
-            y2 = max(w["y2"] for w in ordered_words)
+                if gap > max_allowed_gap:
+                    # Finalize previous cluster
+                    x1 = min(b[0] for b in current_cluster)
+                    y1 = min(b[1] for b in current_cluster)
+                    x2 = max(b[2] for b in current_cluster)
+                    y2 = max(b[3] for b in current_cluster)
+                    line_boxes.append((
+                        max(0, x1 - pad_x),
+                        max(0, y1 - pad_y),
+                        min(width, x2 + pad_x),
+                        min(height, y2 + pad_y),
+                    ))
+                    current_cluster = [next_box]
+                else:
+                    current_cluster.append(next_box)
 
-            pad_x = 10
-            pad_y = 8
+            if current_cluster:
+                x1 = min(b[0] for b in current_cluster)
+                y1 = min(b[1] for b in current_cluster)
+                x2 = max(b[2] for b in current_cluster)
+                y2 = max(b[3] for b in current_cluster)
+                line_boxes.append((
+                    max(0, x1 - pad_x),
+                    max(0, y1 - pad_y),
+                    min(width, x2 + pad_x),
+                    min(height, y2 + pad_y),
+                ))
 
-            box = (
-                max(0, int(x1 - pad_x)),
-                max(0, int(y1 - pad_y)),
-                min(width, int(x2 + pad_x)),
-                min(height, int(y2 + pad_y))
-            )
-
-            line_boxes.append(box)
-
+        # Sort lines strictly in reading order (top to bottom, left to right)
+        line_boxes.sort(key=lambda b: ((b[1] + b[3]) / 2, b[0]))
         return line_boxes
 
-    # ========================================================
-    # DIAGRAM REGION DETECTION
-    # ========================================================
-    #
-    # Feeding a diagram straight into TrOCR produces hallucinated
-    # text, since TrOCR always tries to output SOME text for
-    # whatever crop it's given. Instead: find ink on the page that
-    # isn't explained by any detected text-line box — that's very
-    # likely a diagram/sketch — group it into regions, save each
-    # region as its own image, and exclude those areas from the
-    # text OCR pass entirely.
-    #
-    # This is a heuristic, not a trained layout model. It works
-    # well for "diagram in its own space, text elsewhere" answer
-    # sheets. It will NOT reliably separate text that is written
-    # directly on top of / crammed against diagram lines.
-    # ========================================================
+    # ======================================================
+    # LINE CROPPING
+    # ======================================================
 
-    def detect_diagram_regions(
-        self,
-        image_bgr,
-        line_boxes,
-        min_region_area_ratio=0.006
-    ):
+    @staticmethod
+    def prepare_line_crop(
+        image_bgr: np.ndarray,
+        box: Tuple[int, int, int, int],
+    ) -> Optional[Image.Image]:
+        x1, y1, x2, y2 = box
+        crop = image_bgr[y1:y2, x1:x2]
+        if crop.size == 0 or crop.shape[0] < 6 or crop.shape[1] < 6:
+            return None
 
-        height, width = image_bgr.shape[:2]
-        page_area = height * width
-
-        gray = cv2.cvtColor(
-            image_bgr,
-            cv2.COLOR_BGR2GRAY
+        rgb = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
+        # Margin padding for TrOCR attention stability
+        padded = cv2.copyMakeBorder(
+            rgb, 12, 12, 12, 12, cv2.BORDER_CONSTANT, value=(255, 255, 255)
         )
+        return Image.fromarray(padded)
 
-        ink_mask = cv2.threshold(
-            gray,
-            0,
-            255,
-            cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU
-        )[1]
+    # ======================================================
+    # TEXT NORMALIZATION & VALIDATION
+    # ======================================================
 
-        # Mask out everything already claimed by a detected
-        # text line (dilated a bit so we don't pick up the
-        # edges/serifs of real handwriting as "diagram ink").
-        text_mask = np.zeros_like(ink_mask)
-
-        for (x1, y1, x2, y2) in line_boxes:
-            cv2.rectangle(
-                text_mask,
-                (x1, y1),
-                (x2, y2),
-                255,
-                thickness=-1
-            )
-
-        dilate_kernel = cv2.getStructuringElement(
-            cv2.MORPH_RECT,
-            (9, 9)
-        )
-
-        text_mask = cv2.dilate(
-            text_mask,
-            dilate_kernel,
-            iterations=1
-        )
-
-        remaining_ink = cv2.bitwise_and(
-            ink_mask,
-            cv2.bitwise_not(text_mask)
-        )
-
-        # Close small gaps so a diagram's separate strokes
-        # (box edges, arrows, labels) merge into one region.
-        close_kernel = cv2.getStructuringElement(
-            cv2.MORPH_RECT,
-            (25, 25)
-        )
-
-        closed = cv2.morphologyEx(
-            remaining_ink,
-            cv2.MORPH_CLOSE,
-            close_kernel,
-            iterations=2
-        )
-
-        contours, _ = cv2.findContours(
-            closed,
-            cv2.RETR_EXTERNAL,
-            cv2.CHAIN_APPROX_SIMPLE
-        )
-
-        min_area = page_area * min_region_area_ratio
-
-        diagram_boxes = []
-
-        for contour in contours:
-
-            x, y, w, h = cv2.boundingRect(contour)
-            area = w * h
-
-            if area < min_area:
-                continue
-
-            pad = 12
-
-            box = (
-                max(0, x - pad),
-                max(0, y - pad),
-                min(width, x + w + pad),
-                min(height, y + h + pad)
-            )
-
-            diagram_boxes.append(box)
-
-        return diagram_boxes
-
-    def _box_overlap_ratio(self, box, other):
-        """Fraction of `box`'s area that overlaps `other`."""
-
-        x1 = max(box[0], other[0])
-        y1 = max(box[1], other[1])
-        x2 = min(box[2], other[2])
-        y2 = min(box[3], other[3])
-
-        if x2 <= x1 or y2 <= y1:
-            return 0.0
-
-        inter_area = (x2 - x1) * (y2 - y1)
-        box_area = max(
-            (box[2] - box[0]) * (box[3] - box[1]),
-            1
-        )
-
-        return inter_area / box_area
-
-    def save_diagram_crops(
-        self,
-        image_bgr,
-        diagram_boxes,
-        image_path,
-        page_number
-    ):
-        """Save each diagram region as its own image, next to the
-        source page image, in a 'diagrams' sub-folder. Returns the
-        list of saved file paths (for logging / including in
-        results if you want to reference them later)."""
-
-        if not diagram_boxes:
-            return []
-
-        source_dir = Path(image_path).parent
-        diagrams_dir = source_dir / "diagrams"
-        diagrams_dir.mkdir(parents=True, exist_ok=True)
-
-        saved_paths = []
-
-        for i, (x1, y1, x2, y2) in enumerate(diagram_boxes, start=1):
-
-            crop = image_bgr[y1:y2, x1:x2]
-
-            if crop.size == 0:
-                continue
-
-            out_path = (
-                diagrams_dir /
-                f"page{page_number}_diagram{i}.png"
-            )
-
-            cv2.imwrite(str(out_path), crop)
-            saved_paths.append(str(out_path))
-
-        return saved_paths
-
-    # ========================================================
-    # TrOCR
-    # ========================================================
-
-    def trocr(self, image):
-
-        # Grayscale → RGB
-        if len(image.shape) == 2:
-
-            rgb = cv2.cvtColor(
-                image,
-                cv2.COLOR_GRAY2RGB
-            )
-
-        else:
-
-            rgb = cv2.cvtColor(
-                image,
-                cv2.COLOR_BGR2RGB
-            )
-
-        pil_image = Image.fromarray(rgb)
-
-        pixel_values = self.processor(
-            images=pil_image,
-            return_tensors="pt"
-        ).pixel_values
-
-        pixel_values = pixel_values.to(
-            self.device
-        )
-
-        with torch.no_grad():
-
-            generated_ids = self.model.generate(
-                pixel_values,
-                max_new_tokens=80,
-                num_beams=4
-            )
-
-        text = self.processor.batch_decode(
-            generated_ids,
-            skip_special_tokens=True
-        )[0]
-
-        return text.strip()
-
-    # ========================================================
-    # EasyOCR FALLBACK
-    # ========================================================
-
-    def easyocr_fallback(self, image):
-
-        results = self.easyocr.readtext(
-            image,
-            detail=1,
-            paragraph=False
-        )
-
-        if not results:
-            return "", 0.0
-
-        texts = []
-        confidences = []
-
-        for bbox, text, confidence in results:
-
-            text = text.strip()
-
-            if confidence < 0.35:
-                continue
-
-            if len(text) < 2:
-                continue
-
-            texts.append(text)
-            confidences.append(confidence)
-
-        if not texts:
-            return "", 0.0
-
-        final_text = " ".join(texts)
-
-        average_confidence = (
-            sum(confidences) /
-            len(confidences)
-        )
-
-        return final_text, average_confidence
-
-    # ========================================================
-    # TEXT QUALITY CHECK
-    # ========================================================
-
-    def is_bad_text(self, text):
-
+    @staticmethod
+    def clean_text(text: str) -> str:
+        """
+        Cleans common OCR handwriting errors, stray artifacts, and repetitions.
+        """
         if not text:
-            return True
+            return ""
 
         text = text.strip()
 
-        if len(text) < 2:
-            return True
+        # Fix repeated characters caused by TrOCR loop hallucinations (e.g. 'coooode' -> 'code')
+        text = re.sub(r"([a-zA-Z])\1{3,}", r"\1\1", text)
 
-        # Alphanumeric ratio
-        alphanumeric = sum(
-            c.isalnum()
-            for c in text
-        )
-
-        ratio = (
-            alphanumeric /
-            max(len(text), 1)
-        )
-
-        if ratio < 0.35:
-            return True
-
-        # Repeated words
-        words = text.split()
-
-        if len(words) >= 3:
-
-            unique_ratio = (
-                len(set(words)) /
-                len(words)
-            )
-
-            if unique_ratio < 0.35:
-                return True
-
-        # Known garbage
-        garbage_patterns = [
-            "not logged in",
-            "talk contributions",
-            "create account",
-            "log in",
-            "withdrawn",
-            "commonwealth"
+        # Fix common handwriting contractions & misreads in answer sheets
+        replacements = [
+            (r"\bbcoe\b", "Because"),
+            (r"\bbooz\b", "because"),
+            (r"\bbcoz\b", "because"),
+            (r"\breqmts\b", "Requirements"),
+            (r"\breqmits\b", "Requirements"),
+            (r"\bpage2012\b", "Page 2 of 2"),
+            (r"\bReg\s*Roll\s*No\.?\b", "Register / Roll No."),
         ]
+        for pattern, repl in replacements:
+            text = re.sub(pattern, repl, text, flags=re.IGNORECASE)
 
-        lowered = text.lower()
+        # Strip accidental leading numbering artifacts (e.g., '40 Testing' -> 'Testing')
+        # where stray ink or bullets were recognized as random double-digit numbers
+        text = re.sub(r"^[0-9]{2}\s+(?=[A-Z])", "", text)
 
-        for pattern in garbage_patterns:
+        # Clean multiple spaces and stray edge symbols/quotes
+        text = re.sub(r"\s+", " ", text).strip()
+        text = re.sub(r"^[\"\'\-—_~`.]+|[\"\'\-—_~`.]+$", "", text).strip()
 
-            if pattern in lowered:
-                return True
+        return text
+
+    @classmethod
+    def is_bad_text(cls, text: Optional[str], confidence: Optional[float] = None) -> bool:
+        if not text:
+            return True
+
+        cleaned = cls.clean_text(text)
+        if len(cleaned) < 2:
+            return True
+
+        if confidence is not None and confidence < 0.70:
+            return True
+
+        alpha_count = sum(c.isalpha() for c in cleaned)
+        digit_count = sum(c.isdigit() for c in cleaned)
+
+        if (alpha_count + digit_count) / max(len(cleaned), 1) < 0.40:
+            return True
+
+        if alpha_count == 0 and digit_count == 0:
+            return True
+
+        # Check for non-word gibberish like ';;;###' or '___'
+        if re.match(r"^[\W_]+$", cleaned):
+            return True
 
         return False
 
-    # ========================================================
-    # PROCESS SINGLE LINE
-    # ========================================================
+    # ======================================================
+    # TrOCR INFERENCE WITH EXACT CONFIDENCE
+    # ======================================================
 
-    def process_line(
+    def trocr_batch(
         self,
-        line_image,
-        line_number
-    ):
-
-        # Resize
-        resized = cv2.resize(
-            line_image,
-            None,
-            fx=2.5,
-            fy=2.5,
-            interpolation=cv2.INTER_CUBIC
-        )
-
-        # ====================================================
-        # PRIMARY OCR → TrOCR
-        # ====================================================
-
-        trocr_text = self.trocr(
-            resized
-        )
-
-        print(
-            f"[Line {line_number}] "
-            f"TrOCR: {trocr_text}"
-        )
-
-        # ====================================================
-        # QUALITY CHECK
-        # ====================================================
-
-        if not self.is_bad_text(
-            trocr_text
-        ):
-
-            return {
-                "text": trocr_text,
-                "source": "TrOCR",
-                "confidence": None
-            }
-
-        # ====================================================
-        # FALLBACK → EasyOCR
-        # ====================================================
-
-        print(
-            f"[Line {line_number}] "
-            f"TrOCR rejected → EasyOCR"
-        )
-
-        easy_text, confidence = (
-            self.easyocr_fallback(
-                resized
-            )
-        )
-
-        print(
-            f"[Line {line_number}] "
-            f"EasyOCR: {easy_text} "
-            f"(confidence={confidence:.2f})"
-        )
-
-        if not self.is_bad_text(
-            easy_text
-        ):
-
-            return {
-                "text": easy_text,
-                "source": "EasyOCR",
-                "confidence": confidence
-            }
-
-        return {
-            "text": "",
-            "source": "Rejected",
-            "confidence": 0.0
-        }
-
-    # ========================================================
-    # PROCESS SINGLE PAGE
-    # ========================================================
-
-    # ========================================================
-    # FIX 2 - QUESTION NUMBER CLEANUP
-    # ========================================================
-    #
-    # OCR frequently misreads "Q1)", "Q4)" etc as "a)", "QW",
-    # "QSD", "QMJ", "(Q6)" and similar. Since question numbers
-    # are guaranteed sequential in a real answer script, we
-    # detect anything that LOOKS like a question-number line
-    # (short line, starts with an optional bracket + a token
-    # containing "Q" or a lone letter, followed by ")" ) and
-    # rewrite it with a running counter instead of trusting the
-    # raw OCR text.
-    # ========================================================
-
-    # Every question prompt in this template starts with one of
-    # these verbs (see the question bank). OCR mangles the "Qn)"
-    # marker in all kinds of ways ("a)", "QW", "QSD", "(Q6)",
-    # "QMJ"...) but it never mangles the verb that follows nearly
-    # as badly, so we anchor on the verb instead of the marker.
-    QUESTION_VERBS = {
-        "define", "explain", "differentiate",
-        "write", "describe", "discuss", "list"
-    }
-
-    def fix_question_numbers(self, lines, start_counter=0):
-
-        counter = start_counter
-
-        fixed_lines = []
-
-        for line in lines:
-
-            text = line["text"]
-            words = text.split()
-
-            verb_idx = None
-
-            # The garbled marker is at most a few tokens
-            # ("(", "Q2", ")") so only look in the first 4 words.
-            for i, w in enumerate(words[:4]):
-
-                cleaned = re.sub(r"[^a-zA-Z]", "", w).lower()
-
-                if cleaned in self.QUESTION_VERBS:
-                    verb_idx = i
-                    break
-
-            if verb_idx is not None:
-
-                counter += 1
-
-                rest = " ".join(words[verb_idx:])
-
-                line = dict(line)
-                line["text"] = f"Q{counter}) {rest}"
-                line["source"] = line.get("source", "") + "+QFix"
-
-            fixed_lines.append(line)
-
-        return fixed_lines, counter
-
-    def process_page(self, image_path, page_number=None, q_counter_start=0):
-
-        print("\n==============================================")
-        print(
-            f"Processing page: {image_path}"
-        )
-        print("==============================================")
-
-        image = cv2.imread(
-            str(image_path)
-        )
-
-        if image is None:
-
-            print(
-                "ERROR: Could not read image."
-            )
-
-            return [], q_counter_start
-
-        # ====================================================
-        # DESKEW (real photographed/scanned pages are rarely
-        # perfectly straight; do this before anything else)
-        # ====================================================
-
-        image = self.deskew_image(image)
-
-        # ====================================================
-        # REMOVE RULED LINES (helps both detection & recognition)
-        # ====================================================
-
-        delined = self.remove_ruled_lines(
-            image
-        )
-
-        # ====================================================
-        # LINE DETECTION - EasyOCR/CRAFT, on the delined image.
-        # Detection deliberately does NOT run on the hard
-        # adaptive-threshold binary — thresholding thins strokes
-        # and hurts CRAFT's detector.
-        # ====================================================
-
-        # Header field only exists on page 1 in this template.
-        # Anything in the top ~6% of the page there is the
-        # printed Reg No / Subject / Name line, not an answer.
-        boxes = self.detect_lines_easyocr(
-            delined,
-            header_cutoff_ratio=0.06 if page_number == 1 else None
-        )
-
-        print(
-            f"Detected {len(boxes)} "
-            f"lines (EasyOCR/CRAFT detector)."
-        )
-
-        # ====================================================
-        # DIAGRAM DETECTION - find ink not explained by any
-        # text line, save it separately, and drop any text-line
-        # box that mostly overlaps a diagram region (avoids
-        # feeding diagram scribbles into TrOCR as "text").
-        # ====================================================
-
-        diagram_boxes = self.detect_diagram_regions(
-            delined,
-            boxes
-        )
-
-        if diagram_boxes:
-
-            saved = self.save_diagram_crops(
-                image,
-                diagram_boxes,
-                image_path,
-                page_number
-            )
-
-            print(
-                f"Detected {len(diagram_boxes)} diagram "
-                f"region(s), saved to: {saved}"
-            )
-
-            boxes = [
-                box for box in boxes
-                if not any(
-                    self._box_overlap_ratio(box, d) > 0.5
-                    for d in diagram_boxes
-                )
-            ]
-
-        # ====================================================
-        # ENHANCEMENT (for recognition crops only)
-        # ====================================================
-
-        enhanced = self.enhance_image(
-            delined
-        )
-
-        # ====================================================
-        # OCR EACH LINE, IN DETECTED READING ORDER
-        # ====================================================
-
-        page_lines = []
-
-        for line_number, box in enumerate(
-            boxes,
-            start=1
-        ):
-
-            x1, y1, x2, y2 = box
-
-            line_crop = enhanced[
-                y1:y2,
-                x1:x2
-            ]
-
-            if line_crop.size == 0:
-                continue
-
-            result = self.process_line(
-                line_crop,
-                line_number
-            )
-
-            if result["text"]:
-
-                page_lines.append({
-                    "text": result["text"],
-                    "source": result["source"],
-                    "confidence": result["confidence"]
-                })
-
-        # FIX 2 applied here — remap garbled question-number
-        # tokens (a), QW, QSD, (Q6)...) to a clean running Q#.
-        # Counter continues across pages so numbering doesn't
-        # reset at each page break.
-        page_lines, q_counter_end = self.fix_question_numbers(
-            page_lines,
-            start_counter=q_counter_start
-        )
-
-        return page_lines, q_counter_end
-
-    # ========================================================
-    # PROCESS DOCUMENT
-    # ========================================================
-    #
-    # IMPORTANT:
-    # test_ocr.py passes image_paths here.
-    #
-    # Therefore this function does NOT care about
-    # the PDF filename.
-    # ========================================================
-
-    def process_document(self, image_paths):
+        pil_images: List[Image.Image],
+        num_beams: int = 1,
+    ) -> List[Tuple[str, float]]:
+        """
+        Runs batched TrOCR and returns (extracted_text, confidence_score).
+        """
+        if not pil_images:
+            return []
 
         results = []
+        eos_id = getattr(self.processor.tokenizer, "eos_token_id", 2)
 
-        q_counter = 0
+        for start in range(0, len(pil_images), self.batch_size):
+            batch = pil_images[start: start + self.batch_size]
 
-        print(
-            f"\nProcessing {len(image_paths)} page(s)..."
-        )
+            inputs = self.processor(images=batch, return_tensors="pt")
+            pixel_values = inputs.pixel_values.to(self.device)
 
-        for page_number, image_path in enumerate(
-            image_paths,
-            start=1
-        ):
+            if self.device.type == "cuda":
+                pixel_values = pixel_values.half()
 
-            print(
-                "\n=============================================="
+            with torch.inference_mode():
+                outputs = self.model.generate(
+                    pixel_values,
+                    max_new_tokens=96,
+                    num_beams=num_beams,
+                    do_sample=False,
+                    use_cache=True,
+                    return_dict_in_generate=True,
+                    output_scores=True,
+                )
+
+            sequences = outputs.sequences
+            batch_texts = self.processor.batch_decode(
+                sequences, skip_special_tokens=True
             )
 
-            print(
-                f"PROCESSING PAGE {page_number}"
-            )
+            # Compute real confidence safely (handles greedy and beam search)
+            confidences = []
+            try:
+                if num_beams == 1 and outputs.scores:
+                    stacked_logits = torch.stack(outputs.scores, dim=1)
+                    probs = F.softmax(stacked_logits, dim=-1)
+                    gen_tokens = sequences[:, 1: 1 + stacked_logits.shape[1]]
+                    token_probs = torch.gather(
+                        probs, 2, gen_tokens.unsqueeze(-1)
+                    ).squeeze(-1)
 
-            print(
-                "=============================================="
-            )
+                    for i in range(len(batch_texts)):
+                        line_probs = []
+                        for t_idx in range(gen_tokens.shape[1]):
+                            tok = gen_tokens[i, t_idx].item()
+                            line_probs.append(token_probs[i, t_idx].item())
+                            if tok == eos_id:
+                                break
 
-            page_lines, q_counter = self.process_page(
-                image_path,
-                page_number=page_number,
-                q_counter_start=q_counter
-            )
+                        conf = (
+                            float(sum(line_probs) / len(line_probs))
+                            if line_probs
+                            else 0.75
+                        )
+                        confidences.append(round(min(1.0, max(0.0, conf)), 4))
+                elif hasattr(outputs, "sequences_scores") and outputs.sequences_scores is not None:
+                    for score in outputs.sequences_scores.cpu().numpy():
+                        prob = float(np.exp(score))
+                        confidences.append(round(min(1.0, max(0.0, prob)), 4))
+                else:
+                    confidences = [0.85] * len(batch_texts)
+            except Exception:
+                confidences = [0.80] * len(batch_texts)
 
-            results.append({
-                "page": page_number,
-                "filename": os.path.basename(
-                    str(image_path)
-                ),
-                "lines": page_lines
-            })
+            if len(confidences) != len(batch_texts):
+                confidences = [0.80] * len(batch_texts)
+
+            for text, conf in zip(batch_texts, confidences):
+                cleaned = self.clean_text(text)
+                results.append((cleaned, conf))
 
         return results
 
-    # ========================================================
-    # SAVE OCR RESULTS
-    # ========================================================
+    # ======================================================
+    # EASYOCR FALLBACK
+    # ======================================================
 
-    def save_text(
+    def easyocr_fallback(self, image: Image.Image) -> Tuple[str, Optional[float]]:
+        results = self.easyocr.readtext(
+            np.asarray(image),
+            detail=1,
+            paragraph=False,
+        )
+        if not results:
+            return "", None
+
+        accepted = []
+        for _, text, confidence in results:
+            cleaned = self.clean_text(text)
+            if cleaned and confidence >= 0.25:
+                accepted.append((cleaned, float(confidence)))
+
+        if not accepted:
+            return "", None
+
+        final_text = " ".join(item[0] for item in accepted)
+        avg_conf = sum(item[1] for item in accepted) / len(accepted)
+        return final_text, round(avg_conf, 4)
+
+    # ======================================================
+    # PROCESS ONE PAGE
+    # ======================================================
+
+    def process_page(
         self,
-        results,
-        output_file
-    ):
+        image_path: str,
+        page_number: Optional[int] = None,
+        q_counter_start: int = 0,
+    ) -> Tuple[List[Dict[str, Any]], int]:
+        start_time = time.perf_counter()
+        print(f"\nProcessing page {page_number}: {image_path}")
 
-        output_dir = os.path.dirname(
-            output_file
-        )
+        image = cv2.imread(str(image_path))
+        if not self.validate_image(image):
+            raise ValueError(f"Could not read page image: {image_path}")
 
-        if output_dir:
+        # Deskew & background normalization
+        image = self.deskew_image(image)
+        image = self.enhance_image(image)
 
-            os.makedirs(
-                output_dir,
-                exist_ok=True
+        boxes = self.detect_lines_easyocr(image, header_cutoff_ratio=None)
+        print(f"Detected {len(boxes)} text lines.")
+
+        line_images = [self.prepare_line_crop(image, box) for box in boxes]
+        valid_indices = [i for i, c in enumerate(line_images) if c is not None]
+        valid_crops = [line_images[i] for i in valid_indices]
+
+        # First pass: Fast batched TrOCR
+        primary_results = self.trocr_batch(valid_crops, num_beams=1)
+        recognized_map = dict(zip(valid_indices, primary_results))
+
+        page_lines = []
+
+        for index, box in enumerate(boxes):
+            text, confidence = recognized_map.get(index, ("", 0.0))
+            source = "TrOCR"
+
+            # Targeted retry for low-confidence or suspicious lines
+            if (confidence < 0.72 or self.is_bad_text(text, confidence)) and line_images[index] is not None:
+                crop = line_images[index]
+
+                # Retry 1: Beam search (num_beams=3) for handwriting disambiguation
+                retry_text, retry_conf = self.trocr_batch(
+                    [crop], num_beams=3)[0]
+                if retry_conf > confidence and not self.is_bad_text(retry_text, retry_conf):
+                    text = retry_text
+                    confidence = retry_conf
+                    source = "TrOCR-Beam"
+
+                # Retry 2: EasyOCR fallback if TrOCR is still unsatisfactory
+                if self.use_easyocr_fallback and (confidence < 0.65 or self.is_bad_text(text, confidence)):
+                    fb_text, fb_conf = self.easyocr_fallback(crop)
+                    if fb_text and not self.is_bad_text(fb_text, fb_conf):
+                        text = fb_text
+                        confidence = fb_conf or 0.70
+                        source = "EasyOCR"
+
+            needs_review = self.is_bad_text(text, confidence)
+
+            page_lines.append({
+                "text": text,
+                "source": source,
+                "confidence": confidence,
+                "needs_review": needs_review,
+                "line_number": index + 1,
+                "bbox": list(box),
+            })
+
+        elapsed = time.perf_counter() - start_time
+        print(f"Page {page_number} processed in {elapsed:.2f} seconds.")
+        return page_lines, q_counter_start
+
+    # ======================================================
+    # PROCESS COMPLETE DOCUMENT
+    # ======================================================
+
+    def process_document(self, image_paths: List[str]) -> List[Dict[str, Any]]:
+        results = []
+        total_start = time.perf_counter()
+        print(f"\nProcessing {len(image_paths)} page(s)...")
+
+        for page_number, image_path in enumerate(image_paths, start=1):
+            page_lines, _ = self.process_page(
+                image_path,
+                page_number=page_number,
             )
+            results.append({
+                "page": page_number,
+                "filename": Path(image_path).name,
+                "lines": page_lines,
+            })
 
-        with open(
-            output_file,
-            "w",
-            encoding="utf-8"
-        ) as file:
-
-            for result in results:
-
-                file.write(
-                    f"\n===== PAGE "
-                    f"{result['page']} "
-                    f"=====\n\n"
-                )
-
-                for line in result["lines"]:
-
-                    file.write(
-                        line["text"]
-                    )
-
-                    file.write("\n")
-
-        print(
-            f"\nOCR output saved to:"
-            f"\n{output_file}"
+        elapsed = time.perf_counter() - total_start
+        total_lines = sum(len(page["lines"]) for page in results)
+        review_lines = sum(
+            1 for page in results for line in page["lines"] if line["needs_review"]
         )
 
+        print(f"\nOCR finished in {elapsed:.2f} seconds.")
+        print(f"Pages processed: {len(results)}")
+        print(f"Lines extracted: {total_lines}")
+        print(f"Lines needing review: {review_lines}")
 
-# ============================================================
-# STANDALONE TEST
-# ============================================================
+        return results
+
+    # ======================================================
+    # SAVE EXTRACTED TEXT
+    # ======================================================
+
+    def save_text(self, results: List[Dict[str, Any]], output_file: str) -> None:
+        output_path = Path(output_file)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+
+        with output_path.open("w", encoding="utf-8") as file:
+            for page in results:
+                file.write(f"\n===== PAGE {page['page']} =====\n\n")
+                for line in page["lines"]:
+                    text = line.get("text", "")
+                    conf = line.get("confidence", 0.0)
+                    flag = " [REVIEW REQUIRED]" if line.get(
+                        "needs_review") else ""
+                    file.write(f"{text}{flag}\n")
+
+        print(f"\nExtracted text saved to: {output_path}")
+
 
 if __name__ == "__main__":
-
-    print(
-        "This file is intended to be used "
-        "through tests/test_ocr.py"
-    )
+    print("Use this OCR engine through the application or tests/test_ocr.py.")

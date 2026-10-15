@@ -4,6 +4,7 @@ python-multipart
 
 paddleocr
 paddlepaddle
+easyocr
 
 opencv-python
 Pillow

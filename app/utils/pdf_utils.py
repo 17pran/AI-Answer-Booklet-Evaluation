@@ -1,69 +1,68 @@
 from pathlib import Path
+from typing import List
+
 import pymupdf
+from PIL import Image
 
 
-def pdf_to_images(pdf_path: str, output_dir: str, dpi: int = 200):
+def pdf_to_images(
+    pdf_path: str,
+    output_dir: str,
+    dpi: int = 300,
+) -> List[str]:
     """
-    Convert every PDF page into a PNG image.
+    Convert PDF pages to high-resolution PNG images for handwriting OCR.
+
+    Args:
+        pdf_path: Path to the input PDF.
+        output_dir: Directory for generated images.
+        dpi: Rendering resolution (default: 300 for optimal stroke clarity).
 
     Returns:
-        List of generated image paths.
+        Ordered list of generated image paths.
     """
+    source = Path(pdf_path).expanduser().resolve()
+    destination = Path(output_dir).expanduser().resolve()
 
-    pdf_path = Path(pdf_path)
-    output_dir = Path(output_dir)
+    if not source.is_file():
+        raise FileNotFoundError(f"PDF not found: {source}")
 
-    output_dir.mkdir(parents=True, exist_ok=True)
+    if source.suffix.lower() != ".pdf":
+        raise ValueError("Input file must be a PDF.")
 
-    document = pymupdf.open(pdf_path)
+    if not isinstance(dpi, int) or not 150 <= dpi <= 400:
+        raise ValueError("DPI must be an integer between 150 and 400.")
 
+    destination.mkdir(parents=True, exist_ok=True)
     image_paths = []
 
-    zoom = dpi / 72
-    matrix = pymupdf.Matrix(zoom, zoom)
+    try:
+        with pymupdf.open(str(source)) as document:
+            if document.page_count == 0:
+                raise ValueError("The PDF contains no pages.")
 
-    for page_number, page in enumerate(document, start=1):
+            for page_index, page in enumerate(document):
+                # 300 DPI ensures fine pen strokes are not broken up
+                pixmap = page.get_pixmap(
+                    dpi=dpi,
+                    colorspace=pymupdf.csRGB,
+                    alpha=False,
+                    annots=True,
+                )
 
-        pixmap = page.get_pixmap(
-            matrix=matrix,
-            alpha=False
-        )
+                image_path = destination / f"page_{page_index + 1:04d}.png"
+                pixmap.save(str(image_path))
 
-        output_path = (
-            output_dir /
-            f"{pdf_path.stem}_page_{page_number}.png"
-        )
+                # Verify image integrity
+                with Image.open(image_path) as img:
+                    img.verify()
 
-        pixmap.save(output_path)
+                image_paths.append(str(image_path))
 
-        image_paths.append(str(output_path))
-
-    document.close()
+    except Exception:
+        # Clean up partial files if conversion encounters an error
+        for image_path in image_paths:
+            Path(image_path).unlink(missing_ok=True)
+        raise
 
     return image_paths
-
-
-def extract_text_from_pdf(pdf_path: str):
-    """
-    Extract text from a digital PDF.
-
-    Returns:
-        List of dictionaries containing page and text.
-    """
-
-    document = pymupdf.open(pdf_path)
-
-    pages = []
-
-    for page_number, page in enumerate(document, start=1):
-
-        text = page.get_text("text")
-
-        pages.append({
-            "page": page_number,
-            "text": text.strip()
-        })
-
-    document.close()
-
-    return pages

@@ -1,4 +1,5 @@
 import numpy as np
+
 from sentence_transformers import SentenceTransformer
 
 from app.config import EMBEDDING_MODEL
@@ -9,8 +10,7 @@ class TextbookEmbedder:
     def __init__(self):
 
         print(
-            f"Loading embedding model: "
-            f"{EMBEDDING_MODEL}"
+            f"Loading embedding model: {EMBEDDING_MODEL}"
         )
 
         self.model = SentenceTransformer(
@@ -19,20 +19,51 @@ class TextbookEmbedder:
 
         print("Embedding model loaded.")
 
-    def embed(self, texts):
+    def embed(
+        self,
+        texts,
+        batch_size=64
+    ):
+        """
+        Generate normalized embeddings in batches.
+
+        Returns:
+            NumPy array of shape (number_of_texts, 384)
+            when using all-MiniLM-L6-v2.
+        """
+
+        if not texts:
+            return np.empty(
+                (0, self.model.get_sentence_embedding_dimension()),
+                dtype=np.float32
+            )
 
         embeddings = self.model.encode(
             texts,
-            normalize_embeddings=True
+            batch_size=batch_size,
+            normalize_embeddings=True,
+            convert_to_numpy=True,
+            show_progress_bar=len(texts) > 100
         )
 
-        return np.array(embeddings)
+        return np.asarray(
+            embeddings,
+            dtype=np.float32
+        )
 
     def embed_query(self, query):
+        """
+        Generate an embedding for a single question.
+        """
 
         embedding = self.model.encode(
             [query],
-            normalize_embeddings=True
+            batch_size=1,
+            normalize_embeddings=True,
+            convert_to_numpy=True
         )
 
-        return embedding[0]
+        return np.asarray(
+            embedding[0],
+            dtype=np.float32
+        )

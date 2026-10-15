@@ -11,7 +11,7 @@ def main():
     # TEXTBOOK PDF
     # ---------------------------------------------------------
 
-    pdf_path = Path("data/textbooks/model_answer.pdf")
+    pdf_path = Path("data/textbooks/.pdf")
 
     if not pdf_path.exists():
         print("\nERROR: Textbook PDF not found:")

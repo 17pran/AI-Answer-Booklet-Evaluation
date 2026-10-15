@@ -31,17 +31,9 @@ from app.evaluation.answer_parser import (
 # ============================================================
 
 def parse_student_ocr(ocr_file):
+    text = Path(ocr_file).read_text(encoding="utf-8")
 
-    text = Path(
-        ocr_file
-    ).read_text(
-        encoding="utf-8"
-    )
-
-    # ---------------------------------------------------------
-    # Remove page headers / footers
-    # ---------------------------------------------------------
-
+    # Remove page headers and normalize text
     text = re.sub(
         r"===== PAGE \d+ =====",
         "",
@@ -56,83 +48,34 @@ def parse_student_ocr(ocr_file):
         flags=re.IGNORECASE
     )
 
-    # ---------------------------------------------------------
-    # Normalize OCR text
-    # ---------------------------------------------------------
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    text = text.replace("ﬁ", "fi").replace("ﬂ", "fl")
 
-    text = text.replace(
-        "\r",
-        "\n"
-    )
-
-    text = text.replace(
-        "ﬁ",
-        "fi"
-    )
-
-    text = text.replace(
-        "ﬂ",
-        "fl"
-    )
-
-    # ---------------------------------------------------------
-    # Question markers
-    #
-    # Supports:
-    #
-    # Q12)
-    # Q12 )
-    # Q12.
-    # Q12:
-    # Q12
-    #
-    # Also supports OCR forms such as:
-    # Q 12 )
-    # ---------------------------------------------------------
-
+    # Find question markers such as Q12, Q12), Q 12., etc.
     pattern = re.compile(
-        r"""
-        (?<!\w)
-        Q\s*(\d{1,3})
-        \s*[\)\].:\-]?
-        (?=\s)
-        """,
-        re.IGNORECASE | re.VERBOSE
+        r"(?<!\w)Q\s*(\d{1,3})\s*[\)\].:\-]?(?=\s|$)",
+        re.IGNORECASE
     )
 
-    matches = list(
-        pattern.finditer(text)
-    )
-
+    matches = list(pattern.finditer(text))
     answers = {}
 
     for i, match in enumerate(matches):
-
-        question_number = int(
-            match.group(1)
-        )
+        question_number = int(match.group(1))
 
         start = match.end()
+        end = (
+            matches[i + 1].start()
+            if i + 1 < len(matches)
+            else len(text)
+        )
 
-        if i + 1 < len(matches):
-
-            end = matches[i + 1].start()
-
-        else:
-
-            end = len(text)
-
-        block = text[
-            start:end
-        ].strip()
+        block = text[start:end].strip()
 
         if not block:
             continue
 
-        # -----------------------------------------------------
-        # Remove "Question:" if OCR contains it
-        # -----------------------------------------------------
-
+        # Remove a leading "Question:" label
         block = re.sub(
             r"^\s*Question\s*:\s*",
             "",
@@ -140,106 +83,54 @@ def parse_student_ocr(ocr_file):
             flags=re.IGNORECASE
         )
 
-        # -----------------------------------------------------
-        # Separate Question and Answer
-        #
-        # Example:
-        #
-        # Question: What is SE?
-        # Answer: SE is...
-        # -----------------------------------------------------
-
+        # Prefer an explicit Answer: or Ans: separator
         answer_match = re.search(
-            r"\bAnswer\s*:\s*",
+            r"\b(?:Answer|Ans)\s*[\.:]?\s*",
             block,
             re.IGNORECASE
         )
 
         if answer_match:
-
-            question_text = block[
-                :answer_match.start()
-            ].strip()
-
-            answer_text = block[
-                answer_match.end():
-            ].strip()
+            question_text = block[:answer_match.start()].strip()
+            answer_text = block[answer_match.end():].strip()
 
         else:
+            # If OCR has no answer label, treat the block as
+            # the student's answer rather than inventing a question.
+            question_text = ""
+            answer_text = block
 
-            # -------------------------------------------------
-            # Try "Ans."
-            # -------------------------------------------------
-
-            ans_match = re.search(
-                r"\bAns\s*[\.:]?\s*",
-                block,
-                re.IGNORECASE
-            )
-
-            if ans_match:
-
-                question_text = block[
-                    :ans_match.start()
-                ].strip()
-
-                answer_text = block[
-                    ans_match.end():
-                ].strip()
-
-            else:
-
-                # -------------------------------------------------
-                # If there is no explicit Answer marker,
-                # try to use the first line as the question.
-                # -------------------------------------------------
-
-                lines = [
-                    line.strip()
-                    for line in block.split("\n")
-                    if line.strip()
-                ]
-
-                if len(lines) >= 2:
-
-                    question_text = lines[0]
-
-                    answer_text = " ".join(
-                        lines[1:]
-                    )
-
-                else:
-
-                    question_text = ""
-                    answer_text = block
-
-        question_text = clean_text(
-            question_text
-        )
-
-        answer_text = clean_text(
-            answer_text
-        )
+        question_text = clean_text(question_text)
+        answer_text = clean_text(answer_text)
 
         if not answer_text:
+            print(
+                f"Warning: No answer extracted for Q{question_number}"
+            )
             continue
 
-        # -----------------------------------------------------
-        # Store
-        # -----------------------------------------------------
+        # Avoid silently overwriting an existing answer
+        if question_number in answers:
+            answers[question_number]["answer"] += " " + answer_text
+        else:
+            answers[question_number] = {
+                "question_number": question_number,
+                "question": question_text,
+                "answer": answer_text
+            }
 
-        answers[question_number] = {
-            "question_number": question_number,
-            "question": question_text,
-            "answer": answer_text
-        }
+    print("\n--- OCR PARSING SUMMARY ---")
+
+    for number, item in sorted(answers.items()):
+        print(f"\nQ{number}")
+        print(f"Question: {item['question'] or '(not detected)'}")
+        print(f"Answer: {item['answer'][:250]}")
 
     return answers
-
-
 # ============================================================
 # NORMALIZE QUESTION TEXT
 # ============================================================
+
 
 def normalize_question(text):
 
@@ -370,184 +261,85 @@ def question_similarity(
 # MATCH QUESTIONS
 # ============================================================
 
-def match_questions(
-    student_questions,
-    answer_key_questions
-):
-
+def match_questions(student_questions, answer_key_questions):
     matches = []
 
-    used_student_numbers = set()
-    used_key_numbers = set()
+    # Normalize student question keys and numbers to int
+    student_by_number = {}
+    for k, v in student_questions.items():
+        try:
+            num = int(k)
+            student_by_number[num] = dict(v)
+            student_by_number[num]["question_number"] = num
+        except (ValueError, TypeError):
+            student_by_number[k] = v
 
-    # ---------------------------------------------------------
-    # STEP 1
-    # Exact question number match
-    #
-    # ONLY use this when the question text is also reasonably
-    # compatible.
-    # ---------------------------------------------------------
+    key_by_number = {
+        int(key["question_number"]): key
+        for key in answer_key_questions
+    }
 
-    for key in answer_key_questions:
+    matched_keys = set()
+    matched_students = set()
 
-        key_number = key[
-            "question_number"
-        ]
-
-        key_text = key[
-            "question"
-        ]
-
-        if key_number not in student_questions:
+    # 1. Match questions with the exact same number (int-safe)
+    for number in sorted(student_by_number.keys(), key=lambda x: int(x) if str(x).isdigit() else 999):
+        if number not in key_by_number:
             continue
 
-        student = student_questions[
-            key_number
-        ]
+        student = student_by_number[number]
+        key = key_by_number[number]
 
-        student_text = student[
-            "question"
-        ]
+        if not student.get("answer", "").strip():
+            continue
 
         similarity = question_similarity(
-            student_text,
-            key_text
+            student.get("question", ""),
+            key.get("question", "")
         )
-
-        # If student question text is empty, still allow
-        # exact number.
-        if not student_text:
-
-            matches.append({
-                "student": student,
-                "key": key,
-                "match_type": "EXACT NUMBER",
-                "similarity": 1.0
-            })
-
-            used_student_numbers.add(
-                key_number
-            )
-
-            used_key_numbers.add(
-                key_number
-            )
-
-        elif similarity >= 0.35:
-
-            matches.append({
-                "student": student,
-                "key": key,
-                "match_type": "EXACT NUMBER",
-                "similarity": similarity
-            })
-
-            used_student_numbers.add(
-                key_number
-            )
-
-            used_key_numbers.add(
-                key_number
-            )
-
-    # ---------------------------------------------------------
-    # STEP 2
-    # Question text matching
-    #
-    # This handles:
-    #
-    # Student Q1 → Answer Key Q14
-    # Student Q2 → Answer Key Q16
-    # ---------------------------------------------------------
-
-    remaining_students = [
-        student
-        for number, student
-        in student_questions.items()
-        if number not in used_student_numbers
-    ]
-
-    remaining_keys = [
-        key
-        for key in answer_key_questions
-        if key["question_number"]
-        not in used_key_numbers
-    ]
-
-    candidates = []
-
-    for student in remaining_students:
-
-        for key in remaining_keys:
-
-            similarity = question_similarity(
-                student["question"],
-                key["question"]
-            )
-
-            candidates.append({
-                "student": student,
-                "key": key,
-                "similarity": similarity
-            })
-
-    # Highest similarity first
-    candidates.sort(
-        key=lambda x: x["similarity"],
-        reverse=True
-    )
-
-    used_students = set()
-    used_keys = set()
-
-    for candidate in candidates:
-
-        student_number = candidate[
-            "student"
-        ]["question_number"]
-
-        key_number = candidate[
-            "key"
-        ]["question_number"]
-
-        similarity = candidate[
-            "similarity"
-        ]
-
-        if student_number in used_students:
-            continue
-
-        if key_number in used_keys:
-            continue
-
-        # -----------------------------------------------------
-        # Matching threshold
-        # -----------------------------------------------------
-
-        if similarity < 0.40:
-            continue
 
         matches.append({
-            "student": candidate["student"],
-            "key": candidate["key"],
-            "match_type": "QUESTION TEXT",
+            "student": student,
+            "key": key,
+            "match_type": "EXACT NUMBER",
             "similarity": similarity
         })
+        matched_keys.add(number)
+        matched_students.add(number)
 
-        used_students.add(
-            student_number
-        )
+    # 2. Fallback: match by question text similarity for any remaining questions
+    for s_num, student in student_by_number.items():
+        if s_num in matched_students:
+            continue
+        s_text = student.get("question", "").strip()
+        if not s_text or not student.get("answer", "").strip():
+            continue
 
-        used_keys.add(
-            key_number
-        )
+        best_key = None
+        best_sim = 0.0
+        for k_num, key in key_by_number.items():
+            if k_num in matched_keys:
+                continue
+            sim = question_similarity(s_text, key.get("question", ""))
+            if sim >= 0.35 and sim > best_sim:
+                best_sim = sim
+                best_key = key
+
+        if best_key is not None:
+            matches.append({
+                "student": student,
+                "key": best_key,
+                "match_type": "TEXT SIMILARITY",
+                "similarity": best_sim
+            })
+            matched_keys.add(best_key["question_number"])
+            matched_students.add(s_num)
 
     return matches
-
-
 # ============================================================
 # MAIN
 # ============================================================
+
 
 def main():
 
